@@ -8,6 +8,9 @@
 #include <fstream>
 #include <unordered_map>
 #include <bitset>
+#include <ctime>
+#include <vector>
+#include <cstdlib>
 
 
 // network includes
@@ -26,14 +29,37 @@
 
 #define DATAGRAM_LIMIT 65527
 
+#define COOKIE_LENGTH 48
+#define COOKIE_LOWEST 33
+#define COOKIE_HIGHEST 126
+
+#define MIN_RESERVATION_ID 1000000
+
 using message_id_t = uint8_t;
 using event_id_t = uint32_t;
 using description_length_t = uint8_t;
 using ticket_count_t = uint16_t;
+using expiration_time_t = uint64_t;
+using reservation_id_t = uint32_t;
+struct cookie_t {
+    char c[COOKIE_LENGTH];
+} __attribute__((packed));
+
+struct reservation_info_t {
+    ticket_count_t t_count;
+    cookie_t cookie;
+    expiration_time_t expiration_time;
+} __attribute__((packed));
 
 struct get_reservation_t {
     event_id_t e_id;
     ticket_count_t t_count;
+} __attribute__((packed));
+
+struct reservation_t {
+    reservation_id_t reservation_id;
+    event_id_t e_id;
+    reservation_info_t info;
 } __attribute__((packed));
 
 const message_id_t GET_EVENTS = 1;
@@ -44,6 +70,8 @@ const message_id_t EVENTS = 2;
 const message_id_t RESERVATION = 4;
 const message_id_t TICKETS = 6;
 const message_id_t BAD_REQUEST = 255;
+
+const size_t MAX_TICKETS = 1000; // TODO
 
 char shared_buffer[BUFFER_SIZE];
 
@@ -57,6 +85,10 @@ uint16_t host_to_network(uint16_t x) {
 
 uint32_t host_to_network(uint32_t x) {
     return htonl(x);
+}
+
+uint64_t host_to_network(uint64_t x) {
+    return x; // TODO
 }
 
 uint8_t network_to_host(uint8_t x) {
@@ -125,17 +157,41 @@ void send_message(int socket_fd, const struct sockaddr_in *client_address,
 }
 
 void write_message(int file_fd, const char *message, size_t length) {
-    int flags = 0;
     ssize_t sent_length = write(file_fd, message, length);
     ENSURE(sent_length == (ssize_t) length);
 }
 
-int main(int argc, char *argv[]) {
-    *(uint8_t*)shared_buffer = 222;
-    *(uint64_t*)(shared_buffer + sizeof(uint8_t)) = 1000001;
-    std::cout << (int)*(uint8_t*)shared_buffer << '\n';
-    std::cout << (int)*(uint64_t*)(shared_buffer + sizeof(uint8_t)) << '\n';
+using reservations_map = std::unordered_map<event_id_t, std::unordered_map<reservation_id_t, reservation_info_t>>;
 
+std::unordered_map<event_id_t, std::pair<std::string, ticket_count_t>> events;
+reservations_map reservations;
+reservation_id_t nex_reservation_id = MIN_RESERVATION_ID;
+
+void clear_reservations() {
+    const uint64_t time = std::time(nullptr);
+    for (auto &it_events: reservations) {
+        std::vector<reservation_id_t> to_erase;
+        for (auto &it_reservations: it_events.second) {
+            if (it_reservations.second.expiration_time <= time) {
+                to_erase.push_back(it_reservations.first);
+                events[it_events.first].second += it_reservations.second.t_count;
+            }
+        }
+        for (reservation_id_t id: to_erase) {
+            it_events.second.erase(id);
+        }
+    }
+}
+
+cookie_t generate_cookie() {
+    cookie_t cookie;
+    for (char &c: cookie.c) {
+        c = rand() % (COOKIE_HIGHEST - COOKIE_LOWEST + 1) + COOKIE_LOWEST;
+    }
+    return cookie;
+}
+
+int main(int argc, char *argv[]) {
     std::string file_name;
     uint16_t port = 2022;
     uint32_t timeout = 5;
@@ -161,8 +217,6 @@ int main(int argc, char *argv[]) {
         fatal("incorrect or missing file name");
     }
 
-    std::unordered_map<event_id_t, std::pair<std::string, ticket_count_t>> events;
-
     std::string event_description;
     uint16_t tickets_amount;
     std::ifstream file_stream;
@@ -171,6 +225,7 @@ int main(int argc, char *argv[]) {
     while (std::getline(file_stream, event_description)) {
         file_stream >> tickets_amount;
         events.insert({next_id, {event_description, tickets_amount}});
+        reservations.insert({next_id, {}});
         next_id++;
         if (DEBUG_MESSAGES) {
             std::cerr << "wczytano:\n";
@@ -196,8 +251,8 @@ int main(int argc, char *argv[]) {
     do {
         read_length = read_message(socket_fd, &client_address, shared_buffer,
                                    sizeof(shared_buffer));
-        char *client_ip = inet_ntoa(client_address.sin_addr);
-        uint16_t client_port = ntohs(client_address.sin_port);
+//        char *client_ip = inet_ntoa(client_address.sin_addr);
+//        uint16_t client_port = ntohs(client_address.sin_port);
 
         message_id_t *message_id = (message_id_t *) shared_buffer;
 
@@ -211,8 +266,8 @@ int main(int argc, char *argv[]) {
             if (read_length != sizeof(message_id_t)) {
                 continue; // brak odpowiedzi na niepoprawny komunikat
             }
+            clear_reservations();
             *message_id = EVENTS;
-//            std::cout << "message id: " << (int)*(message_id_t*)(shared_buffer + used_space) << '\n';
             for (auto &event: events) {
                 event_id_t event_id = event.first;
                 std::string description = event.second.first;
@@ -224,46 +279,86 @@ int main(int argc, char *argv[]) {
                 if (used_space + event_data_size > DATAGRAM_LIMIT) {
                     break;
                 }
-                *((event_id_t *)(shared_buffer + used_space)) = host_to_network(event_id);
-//                std::cout << "event id: " << (int)*(event_id_t*)(shared_buffer + used_space) << '\n';
+                *((event_id_t *) (shared_buffer +
+                                  used_space)) = host_to_network(event_id);
                 used_space += sizeof(event_id_t);
 
-                *((ticket_count_t *)(shared_buffer + used_space)) = host_to_network(count);
-//                std::cout << "ticket count: " << (int)*(ticket_count_t *)(shared_buffer + used_space) << '\n';
+                *((ticket_count_t *) (shared_buffer +
+                                      used_space)) = host_to_network(count);
                 used_space += sizeof(ticket_count_t);
 
-                *((description_length_t *)(shared_buffer + used_space)) = host_to_network(desc_len);
-//                std::cout << "desc length: " << (int)*(description_length_t *)(shared_buffer + used_space) << '\n';
+                *((description_length_t *) (shared_buffer +
+                                            used_space)) = host_to_network(
+                        desc_len);
                 used_space += sizeof(description_length_t);
 
-                memcpy(shared_buffer + used_space, description.c_str(), desc_len);
-//                std::cout << "desc: " << std::string(shared_buffer + used_space) << '\n';
+                memcpy(shared_buffer + used_space, description.c_str(),
+                       desc_len);
                 used_space += desc_len;
 
             }
         } else if (*message_id == GET_RESERVATION) {
-            size_t expected_length = sizeof(message_id_t) + sizeof(get_reservation_t);
+            size_t expected_length =
+                    sizeof(message_id_t) + sizeof(get_reservation_t);
             if (read_length != expected_length) {
                 if (DEBUG_MESSAGES) {
-                    std::cerr << "incorrect message length, expected: " << expected_length << ", received: " << read_length << '\n';
+                    std::cerr << "incorrect message length, expected: "
+                              << expected_length << ", received: "
+                              << read_length << '\n';
                 }
                 continue; // brak odpowiedzi na niepoprawny komunikat
             }
 
-            get_reservation_t request = *((get_reservation_t *)(shared_buffer + sizeof(message_id_t)));
+            get_reservation_t request = *((get_reservation_t *) (shared_buffer +
+                                                                 sizeof(message_id_t)));
             request.t_count = network_to_host(request.t_count);
             request.e_id = network_to_host(request.e_id);
-            std::cout << (int)request.e_id << ' ' << (int)request.t_count << '\n';
+            std::cout << (int) request.e_id << ' ' << (int) request.t_count
+                      << '\n';
+
+            clear_reservations();
+
+            if (request.t_count == 0 ||
+                events.find(request.e_id) == events.end() ||
+                events[request.e_id].second < request.t_count ||
+                MAX_TICKETS < request.t_count) {
+                // zła liczba biletów
+                *message_id = BAD_REQUEST;
+                *(event_id_t *) (shared_buffer + used_space) = host_to_network(
+                        request.e_id);
+                used_space += sizeof(event_id_t);
+            } else {
+                *message_id = RESERVATION;
+                events[request.e_id].second -= request.t_count;
+                reservation_id_t reservation_id = nex_reservation_id;
+                nex_reservation_id++;
+                reservation_t reservation;
+                reservation.e_id = host_to_network(request.e_id);
+                reservation.reservation_id = host_to_network(reservation_id);
+                reservation_info_t info;
+                info.t_count = request.t_count;
+                info.expiration_time = std::time(nullptr) + timeout;
+                info.cookie = generate_cookie();
+                reservations[request.e_id].insert({reservation_id, info});
+                info.expiration_time = host_to_network(info.expiration_time);
+                info.t_count = host_to_network(info.t_count);
+                reservation.info = info;
+
+                *(reservation_t *) (shared_buffer + used_space) = reservation;
+                used_space += sizeof(reservation_t);
+            }
+
 
         } else if (*message_id == GET_TICKETS) {
-
+            // TODO
         } else {
             if (DEBUG_MESSAGES)
                 std::cerr << "invalid message id\n";
             continue;
         }
         int fd;
-        if((fd = open("OUTPUT_FILE", O_CREAT | O_TRUNC |O_RDWR, 0666)) == -1) {
+        if ((fd = open("OUTPUT_FILE", O_CREAT | O_TRUNC | O_RDWR, 0666)) ==
+            -1) {
             printf("err file open");
             return errno;
         }
