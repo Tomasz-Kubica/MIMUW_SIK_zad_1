@@ -7,6 +7,8 @@
 #include <iostream>
 #include <fstream>
 #include <unordered_map>
+#include <bitset>
+
 
 // network includes
 #include <arpa/inet.h>
@@ -29,6 +31,11 @@ using event_id_t = uint32_t;
 using description_length_t = uint8_t;
 using ticket_count_t = uint16_t;
 
+struct get_reservation_t {
+    event_id_t e_id;
+    ticket_count_t t_count;
+} __attribute__((packed));
+
 const message_id_t GET_EVENTS = 1;
 const message_id_t GET_RESERVATION = 3;
 const message_id_t GET_TICKETS = 5;
@@ -39,6 +46,30 @@ const message_id_t TICKETS = 6;
 const message_id_t BAD_REQUEST = 255;
 
 char shared_buffer[BUFFER_SIZE];
+
+uint8_t host_to_network(uint8_t x) {
+    return x;
+}
+
+uint16_t host_to_network(uint16_t x) {
+    return htons(x);
+}
+
+uint32_t host_to_network(uint32_t x) {
+    return htonl(x);
+}
+
+uint8_t network_to_host(uint8_t x) {
+    return x;
+}
+
+uint16_t network_to_host(uint16_t x) {
+    return ntohs(x);
+}
+
+uint32_t network_to_host(uint32_t x) {
+    return ntohl(x);
+}
 
 uint16_t read_port(char *string) {
     errno = 0;
@@ -136,7 +167,7 @@ int main(int argc, char *argv[]) {
     uint16_t tickets_amount;
     std::ifstream file_stream;
     file_stream.open(file_name);
-    event_id_t next_id = 1;
+    event_id_t next_id = 0;
     while (std::getline(file_stream, event_description)) {
         file_stream >> tickets_amount;
         events.insert({next_id, {event_description, tickets_amount}});
@@ -175,13 +206,13 @@ int main(int argc, char *argv[]) {
         }
 
         size_t used_space = 0;
+        used_space += sizeof(message_id_t);
         if (*message_id == GET_EVENTS) {
             if (read_length != sizeof(message_id_t)) {
                 continue; // brak odpowiedzi na niepoprawny komunikat
             }
             *message_id = EVENTS;
 //            std::cout << "message id: " << (int)*(message_id_t*)(shared_buffer + used_space) << '\n';
-            used_space += sizeof(message_id_t);
             for (auto &event: events) {
                 event_id_t event_id = event.first;
                 std::string description = event.second.first;
@@ -193,15 +224,15 @@ int main(int argc, char *argv[]) {
                 if (used_space + event_data_size > DATAGRAM_LIMIT) {
                     break;
                 }
-                *((event_id_t *)(shared_buffer + used_space)) = event_id;
+                *((event_id_t *)(shared_buffer + used_space)) = host_to_network(event_id);
 //                std::cout << "event id: " << (int)*(event_id_t*)(shared_buffer + used_space) << '\n';
                 used_space += sizeof(event_id_t);
 
-                *((ticket_count_t *)(shared_buffer + used_space)) = count;
+                *((ticket_count_t *)(shared_buffer + used_space)) = host_to_network(count);
 //                std::cout << "ticket count: " << (int)*(ticket_count_t *)(shared_buffer + used_space) << '\n';
                 used_space += sizeof(ticket_count_t);
 
-                *((description_length_t *)(shared_buffer + used_space)) = desc_len;
+                *((description_length_t *)(shared_buffer + used_space)) = host_to_network(desc_len);
 //                std::cout << "desc length: " << (int)*(description_length_t *)(shared_buffer + used_space) << '\n';
                 used_space += sizeof(description_length_t);
 
@@ -210,10 +241,19 @@ int main(int argc, char *argv[]) {
                 used_space += desc_len;
 
             }
-//            std::cout << "desc len re: " << (int)*(description_length_t *)(shared_buffer +
-//                    sizeof(message_id_t) + sizeof(event_id_t) + sizeof(ticket_count_t) /*+
-//                    sizeof(description_length_t) + 3*/) << '\n';
         } else if (*message_id == GET_RESERVATION) {
+            size_t expected_length = sizeof(message_id_t) + sizeof(get_reservation_t);
+            if (read_length != expected_length) {
+                if (DEBUG_MESSAGES) {
+                    std::cerr << "incorrect message length, expected: " << expected_length << ", received: " << read_length << '\n';
+                }
+                continue; // brak odpowiedzi na niepoprawny komunikat
+            }
+
+            get_reservation_t request = *((get_reservation_t *)(shared_buffer + sizeof(message_id_t)));
+            request.t_count = network_to_host(request.t_count);
+            request.e_id = network_to_host(request.e_id);
+            std::cout << (int)request.e_id << ' ' << (int)request.t_count << '\n';
 
         } else if (*message_id == GET_TICKETS) {
 
@@ -222,13 +262,13 @@ int main(int argc, char *argv[]) {
                 std::cerr << "invalid message id\n";
             continue;
         }
-//        int fd;
-//        if((fd = open("OUTPUT_FILE", O_CREAT | O_TRUNC |O_RDWR, 0666)) == -1) {
-//            printf("err file open");
-//            return errno;
-//        }
-//        write_message(fd, shared_buffer, used_space);
-//        close(fd);
+        int fd;
+        if((fd = open("OUTPUT_FILE", O_CREAT | O_TRUNC |O_RDWR, 0666)) == -1) {
+            printf("err file open");
+            return errno;
+        }
+        write_message(fd, shared_buffer, used_space);
+        close(fd);
         send_message(socket_fd, &client_address, shared_buffer, used_space);
 
     } while (read_length > 0);
