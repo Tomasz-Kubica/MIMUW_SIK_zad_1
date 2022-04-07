@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <endian.h>
 
 #include "err.h"
 
@@ -33,6 +34,8 @@
 #define COOKIE_LOWEST 33
 #define COOKIE_HIGHEST 126
 
+#define TICKET_LENGTH 7
+
 #define MIN_RESERVATION_ID 1000000
 
 using message_id_t = uint8_t;
@@ -41,9 +44,23 @@ using description_length_t = uint8_t;
 using ticket_count_t = uint16_t;
 using expiration_time_t = uint64_t;
 using reservation_id_t = uint32_t;
+
 struct cookie_t {
     char c[COOKIE_LENGTH];
+
+    bool operator==(const cookie_t &other) {
+        for (size_t i = 0; i < COOKIE_LENGTH; i++) {
+            if (this->c[i] != other.c[i])
+                return false;
+        }
+        return true;
+    }
 } __attribute__((packed));
+
+struct ticket_t {
+    char c[7];
+} __attribute__((packed));
+
 
 struct reservation_info_t {
     ticket_count_t t_count;
@@ -62,6 +79,11 @@ struct reservation_t {
     reservation_info_t info;
 } __attribute__((packed));
 
+struct get_tickets_t {
+    reservation_id_t reservation_id;
+    cookie_t cookie;
+} __attribute__((packed));
+
 const message_id_t GET_EVENTS = 1;
 const message_id_t GET_RESERVATION = 3;
 const message_id_t GET_TICKETS = 5;
@@ -72,6 +94,8 @@ const message_id_t TICKETS = 6;
 const message_id_t BAD_REQUEST = 255;
 
 const size_t MAX_TICKETS = 1000; // TODO
+
+const ticket_t TICKET_ZERO = {{'0', '0', '0', '0', '0', '0', '0'}};
 
 char shared_buffer[BUFFER_SIZE];
 
@@ -88,7 +112,7 @@ uint32_t host_to_network(uint32_t x) {
 }
 
 uint64_t host_to_network(uint64_t x) {
-    return x; // TODO
+    return htobe64(x);
 }
 
 uint8_t network_to_host(uint8_t x) {
@@ -132,6 +156,22 @@ int bind_socket(uint16_t port) {
     return socket_fd;
 }
 
+ticket_t next_ticket(ticket_t ticket) {
+    for (char &i: ticket.c) {
+        if (i != 'Z') {
+            if (i == '9')
+                i = 'A';
+            else
+                i++;
+            return ticket;
+        }
+    }
+    if (DEBUG_MESSAGES) {
+        std::cerr << "WARNING: ticket number overflow\n";
+    }
+    return TICKET_ZERO;
+}
+
 size_t
 read_message(int socket_fd, struct sockaddr_in *client_address, char *buffer,
              size_t max_length) {
@@ -165,7 +205,10 @@ using reservations_map = std::unordered_map<event_id_t, std::unordered_map<reser
 
 std::unordered_map<event_id_t, std::pair<std::string, ticket_count_t>> events;
 reservations_map reservations;
+std::unordered_map<reservation_id_t, event_id_t> reservations_to_events;
+std::unordered_map<reservation_id_t, std::pair<std::vector<ticket_t>, cookie_t>> reservation_tickets;
 reservation_id_t nex_reservation_id = MIN_RESERVATION_ID;
+ticket_t next_ticket_number = TICKET_ZERO;
 
 void clear_reservations() {
     const uint64_t time = std::time(nullptr);
@@ -179,6 +222,7 @@ void clear_reservations() {
         }
         for (reservation_id_t id: to_erase) {
             it_events.second.erase(id);
+            reservations_to_events.erase(id);
         }
     }
 }
@@ -340,6 +384,8 @@ int main(int argc, char *argv[]) {
                 info.expiration_time = std::time(nullptr) + timeout;
                 info.cookie = generate_cookie();
                 reservations[request.e_id].insert({reservation_id, info});
+                reservations_to_events.insert(
+                        {reservation_id, (event_id_t) request.e_id});
                 info.expiration_time = host_to_network(info.expiration_time);
                 info.t_count = host_to_network(info.t_count);
                 reservation.info = info;
@@ -350,7 +396,78 @@ int main(int argc, char *argv[]) {
 
 
         } else if (*message_id == GET_TICKETS) {
-            // TODO
+            size_t expected_length =
+                    sizeof(message_id_t) + sizeof(get_tickets_t);
+            if (read_length != expected_length) {
+                if (DEBUG_MESSAGES) {
+                    std::cerr << "incorrect message length, expected: "
+                              << expected_length << ", received: "
+                              << read_length << '\n';
+                }
+                continue; // brak odpowiedzi na niepoprawny komunikat
+            }
+            get_tickets_t get_tickets = *(get_tickets_t *) (shared_buffer +
+                                                            sizeof(message_id_t));
+            get_tickets.reservation_id = network_to_host(
+                    get_tickets.reservation_id);
+            clear_reservations();
+            bool send_tickets = false;
+            if (reservation_tickets.find(get_tickets.reservation_id) !=
+                reservation_tickets.end() &&
+                reservation_tickets[get_tickets.reservation_id].second ==
+                get_tickets.cookie) {
+                *message_id = TICKETS;
+                *(reservation_id_t *) (shared_buffer +
+                                       used_space) = host_to_network(
+                        get_tickets.reservation_id);
+                used_space += sizeof(reservation_id_t);
+                *(ticket_count_t *) (shared_buffer +
+                                     used_space) = host_to_network(
+                        (ticket_count_t) reservation_tickets[get_tickets.reservation_id].first.size());
+                std::cerr << "tickets_count: "
+                          << reservation_tickets[get_tickets.reservation_id].first.size()
+                          << '\n';
+                used_space += sizeof(ticket_count_t);
+                send_tickets = true;
+            } else if (
+                    reservations_to_events.find(get_tickets.reservation_id) !=
+                    reservations_to_events.end() &&
+                    reservations[reservations_to_events[get_tickets.reservation_id]][get_tickets.reservation_id].cookie ==
+                    get_tickets.cookie) {
+                *message_id = TICKETS;
+                *(reservation_id_t *) (shared_buffer +
+                                       used_space) = host_to_network(
+                        get_tickets.reservation_id);
+                used_space += sizeof(reservation_id_t);
+                ticket_count_t ticket_count = reservations[reservations_to_events[get_tickets.reservation_id]][get_tickets.reservation_id].t_count;
+                reservations[reservations_to_events[get_tickets.reservation_id]][get_tickets.reservation_id].t_count = 0; // rezerwacja zrealizowana usuwamy z niej bilety
+                *(ticket_count_t *) (shared_buffer +
+                                     used_space) = host_to_network(
+                        ticket_count);
+                used_space += sizeof(ticket_count_t);
+                std::vector<ticket_t> tickets;
+                for (ticket_count_t i = 0; i < ticket_count; i++) {
+                    tickets.push_back(next_ticket_number);
+                    next_ticket_number = next_ticket(next_ticket_number);
+                }
+                reservation_tickets.insert(
+                        {(reservation_id_t) get_tickets.reservation_id,
+                         {std::move(tickets), get_tickets.cookie}});
+                send_tickets = true;
+            } else {
+                *message_id = BAD_REQUEST;
+                *(reservation_id_t *) (shared_buffer +
+                                       sizeof(message_id_t)) = host_to_network(
+                        get_tickets.reservation_id);
+                used_space += sizeof(reservation_id_t);
+            }
+            if (send_tickets) {
+                for (ticket_t &ticket: reservation_tickets[get_tickets.reservation_id].first) {
+                    *(ticket_t *) (shared_buffer + used_space) = ticket;
+                    used_space += sizeof(ticket_t);
+                }
+            }
+
         } else {
             if (DEBUG_MESSAGES)
                 std::cerr << "invalid message id\n";
@@ -362,6 +479,7 @@ int main(int argc, char *argv[]) {
             printf("err file open");
             return errno;
         }
+        std::cerr << "used space: " << used_space << '\n';
         write_message(fd, shared_buffer, used_space);
         close(fd);
         send_message(socket_fd, &client_address, shared_buffer, used_space);
