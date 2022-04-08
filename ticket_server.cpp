@@ -18,13 +18,11 @@
 
 
 // network includes
-#include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
 #include <cstdint>
-#include <sys/stat.h>
 #include <fcntl.h>
 #include <endian.h>
 
@@ -102,7 +100,7 @@ struct cookie_t {
 } __attribute__((packed));
 
 struct ticket_t {
-    char c[7];
+    char c[TICKET_LENGTH];
 } __attribute__((packed));
 
 
@@ -159,10 +157,6 @@ uint64_t host_to_network(uint64_t x) {
     return htobe64(x);
 }
 
-uint8_t network_to_host(uint8_t x) {
-    return x;
-}
-
 uint16_t network_to_host(uint16_t x) {
     return ntohs(x);
 }
@@ -173,8 +167,12 @@ uint32_t network_to_host(uint32_t x) {
 
 uint16_t read_port(char *string) {
     errno = 0;
-    unsigned long port = strtoul(string, NULL, 10);
+    char *end;
+    unsigned long port = strtoul(string, &end, 10);
     PRINT_ERRNO();
+    if ((size_t)(end - string) != strlen(string)) {
+        fatal("given port couldn't be interpreted as number");
+    }
     if (port > UINT16_MAX) {
         fatal("%ul is not a valid port number", port);
     }
@@ -401,8 +399,10 @@ int main(int argc, char *argv[]) {
                                                                  sizeof(message_id_t)));
             request.t_count = network_to_host(request.t_count);
             request.e_id = network_to_host(request.e_id);
-            std::cout << (int) request.e_id << ' ' << (int) request.t_count
-                      << '\n';
+            if (DEBUG_MESSAGES) {
+                std::cerr << (int) request.e_id << ' ' << (int) request.t_count
+                          << '\n';
+            }
 
             clear_reservations();
 
@@ -468,9 +468,11 @@ int main(int argc, char *argv[]) {
                 *(ticket_count_t *) (shared_buffer +
                                      used_space) = host_to_network(
                         (ticket_count_t) reservation_tickets[get_tickets.reservation_id].first.size());
-                std::cerr << "tickets_count: "
-                          << reservation_tickets[get_tickets.reservation_id].first.size()
-                          << '\n';
+                if (DEBUG_MESSAGES) {
+                    std::cerr << "tickets_count: "
+                              << reservation_tickets[get_tickets.reservation_id].first.size()
+                              << '\n';
+                }
                 used_space += sizeof(ticket_count_t);
                 send_tickets = true;
             } else if (
@@ -517,19 +519,9 @@ int main(int argc, char *argv[]) {
                 std::cerr << "invalid message id\n";
             continue;
         }
-        int fd;
-        if ((fd = open("OUTPUT_FILE", O_CREAT | O_TRUNC | O_RDWR, 0666)) ==
-            -1) {
-            printf("err file open");
-            return errno;
-        }
-        std::cerr << "used space: " << used_space << '\n';
-        write_message(fd, shared_buffer, used_space);
-        close(fd);
         send_message(socket_fd, &client_address, shared_buffer, used_space);
 
     } while (read_length > 0);
-    printf("finished exchange\n");
 
     CHECK_ERRNO(close(socket_fd));
 
